@@ -718,15 +718,19 @@ function parseList(lines, i, ctx) {
     // an open fence inside the item keeps consuming lines (even ones not
     // indented to the item) until it closes, as marked's item scan does
     let fence = fenceStart(itemLines[0].text);
+    let fenceFed = false; // a fence that has taken a proper content line
     j++;
     let pendingBlanks = 0;
     while (j < n) {
       const line = lines[j];
       if (fence) {
-        // fence content lines join the item only when blank or indented
-        // to the item's content column; a short line ends the item and
-        // leaves the fence unclosed
-        if (!isBlank(line) && indentOf(line) < contentIndent) break;
+        // fence content lines join the item when blank or indented to the
+        // item's content column; once the fence has taken one proper
+        // content line, later lines join at any indent until it closes —
+        // but a fence whose first content line falls short ends the item
+        // and is left unclosed
+        if (!isBlank(line) && indentOf(line) < contentIndent && !fenceFed) break;
+        if (!isBlank(line) && indentOf(line) >= contentIndent) fenceFed = true;
         const text = dedentExpanded(line, contentIndent);
         itemLines.push({ text, blank: isBlank(line) });
         if (fenceEnd(text, fence)) fence = null;
@@ -748,6 +752,7 @@ function parseList(lines, i, ctx) {
         }
         itemLines.push({ text: dedentExpanded(line, contentIndent), blank: false });
         fence = fenceStart(itemLines[itemLines.length - 1].text);
+        fenceFed = false;
         j++;
         continue;
       }
@@ -917,28 +922,35 @@ function parseLinkTarget(src, pos) {
   return { href: unescapeStr(href), title: title === null ? null : unescapeStr(title), end: i + 1 };
 }
 
-// Trim an extended-autolink candidate per GFM rules.
+// Trim an extended-autolink candidate the way marked's matcher does: the
+// match is the longest prefix of the candidate that is a sequence of units
+// (single chars, or balanced non-nested paren groups) and ends with a
+// group or a char that is not trailing punctuation. An unmatched '(' ends
+// the match before it; an unmatched ')' can be consumed mid-match but the
+// match cannot end on it; a trailing entity-looking '&word;' is excluded
+// whole.
 function trimAutolink(url) {
-  let s = url;
-  // strip trailing punctuation that is never part of an autolink
-  for (;;) {
-    if (s.length === 0) break;
-    const last = s[s.length - 1];
-    if ('?!.,:*_~'.includes(last)) { s = s.slice(0, -1); continue; }
-    if (last === ')') {
-      const opens = (s.match(/\(/g) || []).length;
-      const closes = (s.match(/\)/g) || []).length;
-      if (closes > opens) { s = s.slice(0, -1); continue; }
+  let best = 0;
+  let ampStart = -1;   // index of a '&' that may begin an entity suffix
+  let ampBest = 0;     // best value before that '&'
+  let i = 0;
+  const n = url.length;
+  while (i < n) {
+    const ch = url[i];
+    if (ch === '(') {
+      let j = i + 1;
+      while (j < n && url[j] !== '(' && url[j] !== ')') j++;
+      if (j < n && url[j] === ')') { i = j + 1; best = i; ampStart = -1; continue; }
+      break;
     }
-    if (last === ';') {
-      // an entity-looking suffix is excluded whole; a bare ';' is trimmed
-      const m = /&[A-Za-z0-9]+;$/.exec(s);
-      if (m) { s = s.slice(0, s.length - m[0].length); continue; }
-      s = s.slice(0, -1); continue;
-    }
-    break;
+    if (ch === '&') { if (ampStart === -1) { ampStart = i; ampBest = best; } }
+    else if (ch === ';' && ampStart !== -1 && /^[A-Za-z0-9]+$/.test(url.slice(ampStart + 1, i))) {
+      best = ampBest; ampStart = -1; i++; continue;
+    } else if (!/[A-Za-z0-9]/.test(ch)) ampStart = -1;
+    i++;
+    if (!'?!.,:*_~;)'.includes(ch)) best = i;
   }
-  return s;
+  return url.slice(0, best);
 }
 
 function parseInline(src, ctx) {
@@ -1002,7 +1014,7 @@ function parseInline(src, ctx) {
       let limit = n;
       let bounded = false;
       for (let k = openers.length - 1; k >= 0; k--) {
-        if (openers[k].linkOk) { limit = openers[k].closeIdx; bounded = true; break; }
+        if (openers[k].linkOk && openers[k].active) { limit = openers[k].closeIdx; bounded = true; break; }
       }
       if (!bounded && openers.length && run >= 2) {
         const rb = src.indexOf(']', i + run);
@@ -1167,12 +1179,12 @@ function parseInline(src, ctx) {
         }
         if (!m && rest.startsWith('www.')) {
           let raw = /^[^\s<]+/.exec(rest)[0];
-          if (openers.length > 0) { const cut = raw.indexOf(']'); if (cut !== -1) raw = raw.slice(0, cut); }
+          if (openers.some(o => o.active)) { const cut = raw.indexOf(']'); if (cut !== -1) raw = raw.slice(0, cut); }
           disp = trimAutolink(raw);
           if (disp.length > 4 && disp.includes('.', 4)) { href = 'http://' + disp; m = disp; }
         } else if (!m && /^https?:\/\//i.test(rest)) {
           let raw = /^[^\s<]+/.exec(rest)[0];
-          if (openers.length > 0) { const cut = raw.indexOf(']'); if (cut !== -1) raw = raw.slice(0, cut); }
+          if (openers.some(o => o.active)) { const cut = raw.indexOf(']'); if (cut !== -1) raw = raw.slice(0, cut); }
           disp = trimAutolink(raw);
           const schemeLen = /^https?:\/\//i.exec(rest)[0].length;
           if (disp.length > schemeLen) { href = disp; m = disp; }
@@ -1306,8 +1318,29 @@ function tryFormLink(src, closeIdx, op, nodes, delims, ctx) {
       const useLabel = src.slice(op.contentStart, closeIdx);
       if (useLabel === '') return null;
       const def = ctx.refs.get(normalizeLabel(useLabel));
+      if (def) { href = def.href; title = def.title; end = after; }
+      else if (src[after + 1] !== '<') {
+        // marked deviation: a link-shaped unit whose target is invalid
+        // (and does not start with '<') and whose label has no definition
+        // is emitted as one literal text run — no inline parsing inside
+        let depth = 0, e = -1;
+        for (let k = after; k < src.length; k++) {
+          const ch = src[k];
+          if (ch === '\\') { k++; continue; }
+          if (ch === '(') depth++;
+          else if (ch === ')') { depth--; if (depth === 0) { e = k; break; } }
+        }
+        if (e === -1) return null;
+        const children = nodes.splice(nodeIdx + 1);
+        for (let k = delims.length - 1; k >= 0; k--) {
+          if (children.includes(delims[k].node)) delims.splice(k, 1);
+        }
+        nodes.length = nodeIdx;
+        const start = op.image ? op.contentStart - 2 : op.contentStart - 1;
+        nodes.push({ kind: 'text', text: src.slice(start, e + 1) });
+        return e + 1;
+      }
       if (!def) return null;
-      href = def.href; title = def.title; end = after;
     }
   } else if (src[after] === '[') {
     if (!labelTicksOk(src.slice(op.contentStart, closeIdx))) return null;
